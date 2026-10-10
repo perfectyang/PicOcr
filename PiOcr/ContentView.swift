@@ -21,8 +21,6 @@ private final class ScreenshotEditorPanel: NSPanel {
 
 @MainActor
 private final class CaptureSelectionPanel: NSPanel {
-    // Borderless panels do not become key by default. The selection overlay
-    // relies on SwiftUI drag gestures, so it must receive mouse interaction.
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
@@ -52,126 +50,110 @@ final class PiOcrModel {
         let filter = SCContentFilter(display: display, excludingApplications: ownApplication, exceptingWindows: [])
         let configuration = SCStreamConfiguration()
         let pixelScale = max(1, CGFloat(filter.pointPixelScale))
-        configuration.width = max(1, display.width) * Int(pixelScale)
-        configuration.height = max(1, display.height) * Int(pixelScale)
+        configuration.width = max(1, Int((CGFloat(display.width) * pixelScale).rounded()))
+        configuration.height = max(1, Int((CGFloat(display.height) * pixelScale).rounded()))
+        configuration.showsCursor = false
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
         return NSImage(cgImage: image, size: screen.frame.size)
     }
 
     func startCapture(recognize: Bool = false) {
-        startNativeScreenshot(recognize: recognize)
-    }
-
-    private func startNativeScreenshot(recognize: Bool) {
-        let previousChangeCount = NSPasteboard.general.changeCount
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = ["-i", "-c"]
-
-        do {
-            try process.run()
-        } catch {
-            showMessage("无法启动系统截图", detail: error.localizedDescription)
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else {
+            showMessage("无法开始截图", detail: "没有找到鼠标所在的显示器。")
             return
         }
 
-        let selectionTracker = CaptureSelectionTracker()
-        let trackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { _ in
-            selectionTracker.sample(mouseIsDown: NSEvent.pressedMouseButtons & 1 != 0, at: NSEvent.mouseLocation)
-        }
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            process.waitUntilExit()
-            let status = process.terminationStatus
-            DispatchQueue.main.async {
-                trackingTimer.invalidate()
-                guard let self else { return }
-                guard status == 0 else {
-                    self.showMessage("系统截图失败", detail: "macOS 截图工具退出，错误码：\(status)")
-                    return
+        recognizedText = ""
+        Task {
+            var captures: [(image: NSImage, screen: NSScreen)] = []
+            var lastCaptureError: Error?
+            for screen in screens {
+                do {
+                    let image = try await captureFullDisplay(screen)
+                    captures.append((image, screen))
+                } catch {
+                    lastCaptureError = error
                 }
-                let pasteboard = NSPasteboard.general
-                guard pasteboard.changeCount != previousChangeCount else {
-                    self.showMessage("没有获取到截图", detail: "系统截图已结束，但剪贴板中的图片没有更新。请再试一次区域截图。")
-                    return
-                }
-                guard let image = NSImage(pasteboard: pasteboard) else {
-                    self.showMessage("无法读取截图", detail: "剪贴板内容不是可读取的图片，请再试一次区域截图。")
-                    return
-                }
-                self.screenshot = image
-                self.recognizedText = ""
-                if recognize {
-                    self.recognizeText()
-                } else {
-                    let selectedRect = selectionTracker.finish(at: NSEvent.mouseLocation)
-                    let midpoint = CGPoint(x: selectedRect.midX, y: selectedRect.midY)
-                    let screen = NSScreen.screens.first(where: { $0.frame.contains(midpoint) }) ?? NSScreen.main
-                    guard let screen else { return }
-                    self.showEditor(at: selectedRect, on: screen)
-                }
+            }
+            guard !captures.isEmpty else {
+                let detail = lastCaptureError?.localizedDescription ?? "没有找到可用的显示器截图。"
+                showMessage("无法捕获屏幕", detail: "请在系统设置的“隐私与安全性 > 屏幕录制”中允许 PiOcr，然后重新打开应用。\n\n\(detail)")
+                return
+            }
+            for capture in captures {
+                screenshot = capture.image
+                showSelectionCanvas(capture.image, on: capture.screen, recognize: recognize)
             }
         }
     }
 
-    private func showSelectionAdjuster(_ image: NSImage, selectedRect: CGRect, on screen: NSScreen) {
-        let panel = CaptureSelectionPanel(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
+    private func closeSelectionCanvases() {
+        for panel in selectionPanels.values { panel.close() }
+        selectionPanels.removeAll()
+    }
+
+    private func showSelectionCanvas(_ image: NSImage, on screen: NSScreen, recognize: Bool) {
+        let panel = CaptureSelectionPanel(contentRect: screen.frame,
+                                          styleMask: [.borderless, .nonactivatingPanel],
+                                          backing: .buffered, defer: false)
+        panel.isOpaque = true
+        panel.backgroundColor = .black
         panel.hasShadow = false
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.animationBehavior = .none
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         let id = UUID()
-        panel.contentView = NSHostingView(rootView: SelectionAdjusterView(
-            model: self,
+        panel.contentView = NSHostingView(rootView: SelectionCanvasView(
             image: image,
-            screen: screen,
-            initialRect: CGRect(
-                x: selectedRect.minX - screen.frame.minX,
-                y: screen.frame.maxY - selectedRect.maxY,
-                width: selectedRect.width,
-                height: selectedRect.height
-            ),
-            onFinish: { [weak self, weak panel] rect, action in
+            recognize: recognize,
+            onSelection: { [weak self] rect in
                 guard let self else { return }
-                panel?.close()
-                self.selectionPanels[id] = nil
-                guard action != .close else { return }
+                guard rect.width >= 2, rect.height >= 2 else { return }
+                self.closeSelectionCanvases()
+                guard let cropImage = self.cropImage(image, rect: rect, on: screen) else { return }
+                self.screenshot = cropImage
+                self.recognizeText()
+            },
+            onAction: { [weak self] rect, action, cropImage in
+                guard let self else { return }
+                self.closeSelectionCanvases()
+                self.screenshot = cropImage
+
                 let globalRect = CGRect(
                     x: screen.frame.minX + rect.minX,
                     y: screen.frame.maxY - rect.maxY,
                     width: rect.width,
                     height: rect.height
                 )
-                guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
-                let scaleX = CGFloat(cgImage.width) / max(screen.frame.width, 1)
-                let scaleY = CGFloat(cgImage.height) / max(screen.frame.height, 1)
-                let cropRect = CGRect(x: rect.minX * scaleX, y: rect.minY * scaleY,
-                                      width: rect.width * scaleX, height: rect.height * scaleY)
-                    .integral.intersection(CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
-                guard let crop = cgImage.cropping(to: cropRect) else { return }
-                self.screenshot = NSImage(cgImage: crop, size: rect.size)
-                let cropImage = self.screenshot ?? NSImage(cgImage: crop, size: rect.size)
-                guard let editorID = self.showEditor(at: globalRect, on: screen) else { return }
                 switch action {
-                case .edit: break
-                case .pin: self.pinEditor(editorID, image: cropImage)
+                case .pin:
+                    guard let editorID = self.showEditor(at: globalRect, on: screen) else { return }
+                    self.pinEditor(editorID, image: cropImage)
                 case .copy:
                     _ = self.copyImage(cropImage)
-                    self.closeEditor(editorID)
-                case .save: self.saveImage(cropImage, from: editorID)
-                case .close: break
+                case .save:
+                    guard let editorID = self.showEditor(at: globalRect, on: screen) else { return }
+                    self.saveImage(cropImage, from: editorID)
                 }
             },
-            onCancel: { [weak self, weak panel] in
-                panel?.close()
-                self?.selectionPanels[id] = nil
+            onCancel: { [weak self] in
+                self?.closeSelectionCanvases()
             }
         ))
         selectionPanels[id] = panel
-        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
-        panel.orderFrontRegardless()
+    }
+
+    private func cropImage(_ image: NSImage, rect: CGRect, on screen: NSScreen) -> NSImage? {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let scaleX = CGFloat(cgImage.width) / max(screen.frame.width, 1)
+        let scaleY = CGFloat(cgImage.height) / max(screen.frame.height, 1)
+        let cropRect = CGRect(x: rect.minX * scaleX, y: rect.minY * scaleY,
+                              width: rect.width * scaleX, height: rect.height * scaleY)
+            .integral.intersection(CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+        guard let crop = cgImage.cropping(to: cropRect) else { return nil }
+        return NSImage(cgImage: crop, size: rect.size)
     }
 
     @discardableResult
@@ -258,6 +240,7 @@ final class PiOcrModel {
         panel.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
         panel.setFrame(imageFrame, display: true, animate: false)
         panel.level = .floating
+        panel.hidesOnDeactivate = false
         panel.hasShadow = true
         panel.isMovableByWindowBackground = true
         dimPanels[id]?.close()
@@ -345,27 +328,6 @@ final class PiOcrModel {
     }
 }
 
-private final class CaptureSelectionTracker {
-    private var start: CGPoint?
-    private var latest = CGPoint.zero
-
-    func sample(mouseIsDown: Bool, at point: CGPoint) {
-        latest = point
-        if mouseIsDown, start == nil { start = point }
-    }
-
-    func finish(at point: CGPoint) -> CGRect {
-        latest = point
-        guard let start else { return CGRect(origin: point, size: CGSize(width: 1, height: 1)) }
-        return CGRect(
-            x: min(start.x, latest.x),
-            y: min(start.y, latest.y),
-            width: max(1, abs(start.x - latest.x)),
-            height: max(1, abs(start.y - latest.y))
-        )
-    }
-}
-
 private struct SelectionDragInput: NSViewRepresentable {
     let onStart: (CGPoint) -> Void
     let onMove: (CGPoint) -> Void
@@ -434,170 +396,370 @@ private struct SelectionDimOverlay: View {
     }
 }
 
-private enum SelectionResizeHandle: CaseIterable, Identifiable {
-    case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left
-    var id: Self { self }
-
-    var horizontal: Int {
-        switch self { case .topLeft, .left, .bottomLeft: -1; case .top, .bottom: 0; case .topRight, .right, .bottomRight: 1 }
-    }
-
-    var vertical: Int {
-        switch self { case .topLeft, .top, .topRight: -1; case .left, .right: 0; case .bottomLeft, .bottom, .bottomRight: 1 }
-    }
-}
-
 private enum SelectionAction {
-    case edit, pin, copy, save, close
+    case pin, copy, save
 }
 
-private struct SelectionAdjusterView: View {
-    let model: PiOcrModel
+private struct SelectionCanvasView: View {
     let image: NSImage
-    let screen: NSScreen
-    let initialRect: CGRect
-    let onFinish: (CGRect, SelectionAction) -> Void
+    let recognize: Bool
+    let onSelection: (CGRect) -> Void
+    let onAction: (CGRect, SelectionAction, NSImage) -> Void
     let onCancel: () -> Void
-    @State private var selection: CGRect
-    @State private var hasSelection: Bool
-    @State private var creationOrigin: CGPoint?
-    @State private var moveOrigin: CGRect?
-    @State private var resizeOrigin: CGRect?
 
-    init(model: PiOcrModel, image: NSImage, screen: NSScreen, initialRect: CGRect,
-         onFinish: @escaping (CGRect, SelectionAction) -> Void, onCancel: @escaping () -> Void) {
-        self.model = model
-        self.image = image
-        self.screen = screen
-        self.initialRect = initialRect
-        self.onFinish = onFinish
-        self.onCancel = onCancel
-        _selection = State(initialValue: initialRect)
-        _hasSelection = State(initialValue: initialRect.width > 0 && initialRect.height > 0)
-    }
+    @State private var selection: CGRect?
+    @State private var dragOrigin: CGPoint?
+    @State private var selectionAtDragStart: CGRect?
+    @State private var selectedTool: MarkupTool?
+    @State private var selectedColor: Color = .red
+    @State private var selectedFontSize: CGFloat = 24
+    @State private var markups: [Markup] = []
+    @State private var draft: Markup?
+    @State private var textEntryPosition: CGPoint?
+    @State private var annotationText = ""
+    @State private var editingMarkupID: UUID?
+    @State private var editingMarkupColor: Color?
+    @State private var movingMarkupID: UUID?
+    @State private var movingMarkupOrigin: CGPoint?
+    @FocusState private var textFieldFocused: Bool
 
-    private var screenSize: CGSize { screen.frame.size }
+    private func updateDrag(to point: CGPoint, in size: CGSize) {
+        guard let dragOrigin else { return }
+        let boundedPoint = CGPoint(x: min(max(point.x, 0), size.width), y: min(max(point.y, 0), size.height))
 
-    private func moveSelection(_ translation: CGSize) {
-        guard let origin = moveOrigin else { return }
-        selection.origin = CGPoint(
-            x: min(max(origin.minX + translation.width, 0), max(0, screenSize.width - origin.width)),
-            y: min(max(origin.minY + translation.height, 0), max(0, screenSize.height - origin.height))
-        )
-    }
+        if let origin = selectionAtDragStart {
+            let x = min(max(origin.minX + boundedPoint.x - dragOrigin.x, 0), max(0, size.width - origin.width))
+            let y = min(max(origin.minY + boundedPoint.y - dragOrigin.y, 0), max(0, size.height - origin.height))
+            selection = CGRect(origin: CGPoint(x: x, y: y), size: origin.size)
+            return
+        }
 
-    private func resizeSelection(_ handle: SelectionResizeHandle, translation: CGSize) {
-        let origin = resizeOrigin ?? selection
-        resizeOrigin = origin
-        var minX = origin.minX
-        var maxX = origin.maxX
-        var minY = origin.minY
-        var maxY = origin.maxY
-        if handle.horizontal < 0 { minX = min(max(0, origin.minX + translation.width), maxX - 24) }
-        if handle.horizontal > 0 { maxX = max(min(screenSize.width, origin.maxX + translation.width), minX + 24) }
-        if handle.vertical < 0 { minY = min(max(0, origin.minY + translation.height), maxY - 24) }
-        if handle.vertical > 0 { maxY = max(min(screenSize.height, origin.maxY + translation.height), minY + 24) }
-        selection = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-    }
-
-    private func handlePoint(_ handle: SelectionResizeHandle) -> CGPoint {
-        let x: CGFloat = handle.horizontal < 0 ? selection.minX : (handle.horizontal > 0 ? selection.maxX : selection.midX)
-        let y: CGFloat = handle.vertical < 0 ? selection.minY : (handle.vertical > 0 ? selection.maxY : selection.midY)
-        return CGPoint(x: x, y: y)
-    }
-
-    private func beginNewSelection(at point: CGPoint) {
-        guard !hasSelection || !selection.contains(point) else { return }
-        creationOrigin = point
-        hasSelection = false
-        updateNewSelection(to: point)
-    }
-
-    private func updateNewSelection(to point: CGPoint) {
-        guard let creationOrigin else { return }
         selection = CGRect(
-            x: min(creationOrigin.x, point.x),
-            y: min(creationOrigin.y, point.y),
-            width: max(1, abs(point.x - creationOrigin.x)),
-            height: max(1, abs(point.y - creationOrigin.y))
+            x: min(dragOrigin.x, boundedPoint.x),
+            y: min(dragOrigin.y, boundedPoint.y),
+            width: abs(boundedPoint.x - dragOrigin.x),
+            height: abs(boundedPoint.y - dragOrigin.y)
         )
     }
 
-    private func endNewSelection(at point: CGPoint) {
-        guard creationOrigin != nil else { return }
-        updateNewSelection(to: point)
-        hasSelection = selection.width >= 8 && selection.height >= 8
-        creationOrigin = nil
+    private func textMarkup(at location: CGPoint, in size: CGSize) -> Markup? {
+        return markups.last { markup in
+            guard markup.tool == .text, let origin = markup.points.first else { return false }
+            let fontSize = markup.fontSize > 0 ? markup.fontSize : max(16, size.width / 30)
+            let rect = CGRect(x: origin.x * size.width - 9,
+                              y: origin.y * size.height - 7,
+                              width: max(fontSize, CGFloat(markup.label.count) * fontSize * 0.7) + 18,
+                              height: fontSize * 1.5 + 14)
+            return rect.contains(location)
+        }
+    }
+
+    private func beginTextEntry(at location: CGPoint, in size: CGSize) {
+        let point = CGPoint(x: min(max(location.x / max(size.width, 1), 0), 1),
+                            y: min(max(location.y / max(size.height, 1), 0), 1))
+        if let existing = textMarkup(at: location, in: size) {
+            editingMarkupID = existing.id
+            editingMarkupColor = existing.color
+            selectedColor = existing.color
+            selectedFontSize = existing.fontSize > 0 ? existing.fontSize : max(16, size.width / 30)
+            textEntryPosition = existing.points.first
+            annotationText = existing.label
+        } else {
+            editingMarkupID = nil
+            editingMarkupColor = nil
+            textEntryPosition = point
+            annotationText = ""
+        }
+        DispatchQueue.main.async { textFieldFocused = true }
+    }
+
+    private func commitTextEntry() {
+        if let editingMarkupID, let index = markups.firstIndex(where: { $0.id == editingMarkupID }) {
+            if annotationText.isEmpty {
+                markups.remove(at: index)
+            } else {
+                markups[index].label = annotationText
+                if let editingMarkupColor, selectedColor != editingMarkupColor {
+                    markups[index].color = selectedColor
+                }
+                markups[index].fontSize = selectedFontSize
+            }
+        } else if let textEntryPosition, !annotationText.isEmpty {
+            markups.append(Markup(tool: .text, points: [textEntryPosition], label: annotationText,
+                                  color: selectedColor, fontSize: selectedFontSize))
+        }
+        textEntryPosition = nil
+        editingMarkupID = nil
+        editingMarkupColor = nil
+        annotationText = ""
+        textFieldFocused = false
+    }
+
+    private func drawMarkups(in context: inout GraphicsContext, size: CGSize) {
+        for markup in markups.filter({ $0.id != editingMarkupID }) + (draft.map { [$0] } ?? []) {
+            guard let first = markup.points.first else { continue }
+            let start = CGPoint(x: first.x * size.width, y: first.y * size.height)
+            var path = Path()
+            path.move(to: start)
+            if markup.tool == .pen {
+                for point in markup.points.dropFirst() {
+                    path.addLine(to: CGPoint(x: point.x * size.width, y: point.y * size.height))
+                }
+            } else if markup.points.count > 1 {
+                let end = CGPoint(x: markup.points[1].x * size.width, y: markup.points[1].y * size.height)
+                if markup.tool == .rectangle {
+                    path.addRect(CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                                        width: abs(start.x - end.x), height: abs(start.y - end.y)))
+                } else if markup.tool == .arrow {
+                    path.addLine(to: end)
+                    let angle = atan2(end.y - start.y, end.x - start.x)
+                    let headLength: CGFloat = 12
+                    for offset: CGFloat in [-0.55, 0.55] {
+                        path.move(to: end)
+                        path.addLine(to: CGPoint(x: end.x - headLength * cos(angle + offset),
+                                                 y: end.y - headLength * sin(angle + offset)))
+                    }
+                }
+            }
+            context.stroke(path, with: .color(markup.color),
+                           style: StrokeStyle(lineWidth: max(2, size.width / 250), lineCap: .round, lineJoin: .round))
+            if markup.tool == .text, !markup.label.isEmpty {
+                let fontSize = markup.fontSize > 0 ? markup.fontSize : max(16, size.width / 30)
+                context.draw(Text(markup.label).font(.system(size: fontSize, weight: .bold)).foregroundColor(markup.color),
+                             at: start, anchor: .topLeading)
+            }
+        }
+        if let textEntryPosition, !annotationText.isEmpty, !textFieldFocused {
+            let start = CGPoint(x: textEntryPosition.x * size.width, y: textEntryPosition.y * size.height)
+            context.draw(Text(annotationText).font(.system(size: selectedFontSize, weight: .bold)).foregroundColor(selectedColor),
+                         at: start, anchor: .topLeading)
+        }
+    }
+
+    private func renderedSelection(_ rect: CGRect) -> NSImage? {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let scaleX = CGFloat(cgImage.width) / max(image.size.width, 1)
+        let scaleY = CGFloat(cgImage.height) / max(image.size.height, 1)
+        let pixelRect = CGRect(x: rect.minX * scaleX, y: rect.minY * scaleY,
+                               width: rect.width * scaleX, height: rect.height * scaleY)
+            .integral.intersection(CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+        guard let cropped = cgImage.cropping(to: pixelRect) else { return nil }
+        let base = NSImage(cgImage: cropped, size: rect.size)
+        guard !markups.isEmpty else { return base }
+
+        let renderer = ImageRenderer(content:
+            ZStack {
+                Image(nsImage: base).resizable().frame(width: rect.width, height: rect.height)
+                Canvas { context, size in drawMarkups(in: &context, size: size) }
+                    .frame(width: rect.width, height: rect.height)
+            }
+            .frame(width: rect.width, height: rect.height)
+        )
+        renderer.scale = max(1, CGFloat(cropped.width) / max(rect.width, 1))
+        return renderer.nsImage ?? base
+    }
+
+    private func finish(_ action: SelectionAction, rect: CGRect) {
+        if textEntryPosition != nil { commitTextEntry() }
+        guard let rendered = renderedSelection(rect) else { return }
+        onAction(rect, action, rendered)
     }
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            Image(nsImage: image)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: screenSize.width, height: screenSize.height)
+        GeometryReader { geometry in
+            let size = geometry.size
+            ZStack(alignment: .topLeading) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: size.width, height: size.height)
+                    .allowsHitTesting(false)
+
+                SelectionDragInput(
+                    onStart: { point in
+                        guard selectedTool == nil else { return }
+                        if let selection, selection.contains(point) {
+                            dragOrigin = point
+                            selectionAtDragStart = selection
+                            return
+                        }
+                        guard selection == nil else { return }
+                        dragOrigin = point
+                        selectionAtDragStart = nil
+                        selection = CGRect(origin: point, size: .zero)
+                    },
+                    onMove: { updateDrag(to: $0, in: size) },
+                    onEnd: { point in
+                        guard selectedTool == nil else { return }
+                        updateDrag(to: point, in: size)
+                        let isCreatingSelection = selectionAtDragStart == nil
+                        guard let rect = selection, rect.width >= 2, rect.height >= 2 else {
+                            if isCreatingSelection { selection = nil }
+                            dragOrigin = nil
+                            selectionAtDragStart = nil
+                            return
+                        }
+                        dragOrigin = nil
+                        selectionAtDragStart = nil
+                        if recognize && isCreatingSelection { onSelection(rect) }
+                    }
+                )
+                .frame(width: size.width, height: size.height)
+                .allowsHitTesting(selectedTool == nil)
+
+                Canvas { context, canvasSize in
+                    guard let selection else { return }
+                    var mask = Path()
+                    mask.addRect(CGRect(origin: .zero, size: canvasSize))
+                    mask.addRect(selection)
+                    context.fill(mask, with: .color(.black.opacity(0.48)), style: FillStyle(eoFill: true))
+
+                    let lineWidth: CGFloat = 1.5
+                    let borderRect = selection.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
+                    guard borderRect.width > 0, borderRect.height > 0 else { return }
+                    context.stroke(Path(borderRect), with: .color(.cyan), lineWidth: lineWidth)
+                }
                 .allowsHitTesting(false)
-            SelectionDragInput(
-                onStart: beginNewSelection,
-                onMove: updateNewSelection(to:),
-                onEnd: endNewSelection(at:)
-            )
-            .frame(width: screenSize.width, height: screenSize.height)
-            Canvas { context, size in
-                // Keep the desktop undimmed until the user starts dragging.
-                // Once a selection exists, dim everything outside its bounds.
-                guard hasSelection || creationOrigin != nil else { return }
-                var mask = Path()
-                mask.addRect(CGRect(origin: .zero, size: size))
-                mask.addRect(selection)
-                context.fill(mask, with: .color(.black.opacity(0.48)), style: FillStyle(eoFill: true))
-            }
-            .allowsHitTesting(false)
-            if hasSelection || creationOrigin != nil {
-                Rectangle()
-                    .stroke(Color.cyan, lineWidth: 2)
+
+                if let selection {
+                    ZStack(alignment: .topLeading) {
+                        Canvas { context, canvasSize in drawMarkups(in: &context, size: canvasSize) }
+                        if selectedTool != nil {
+                            Color.clear
+                                .contentShape(Rectangle())
+                                .gesture(DragGesture(minimumDistance: selectedTool == .pen ? 0 : (selectedTool == .text ? 3 : 4))
+                                    .onChanged { value in
+                                        guard let selectedTool else { return }
+                                        if selectedTool == .text {
+                                            if movingMarkupID == nil,
+                                               let markup = textMarkup(at: value.startLocation, in: selection.size),
+                                               let origin = markup.points.first {
+                                                movingMarkupID = markup.id
+                                                movingMarkupOrigin = origin
+                                            }
+                                            guard let movingMarkupID, let movingMarkupOrigin,
+                                                  let index = markups.firstIndex(where: { $0.id == movingMarkupID }) else { return }
+                                            markups[index].points[0] = CGPoint(
+                                                x: min(max(movingMarkupOrigin.x + value.translation.width / max(selection.width, 1), 0), 1),
+                                                y: min(max(movingMarkupOrigin.y + value.translation.height / max(selection.height, 1), 0), 1)
+                                            )
+                                            return
+                                        }
+
+                                        let start = CGPoint(x: value.startLocation.x / max(selection.width, 1),
+                                                            y: value.startLocation.y / max(selection.height, 1))
+                                        let current = CGPoint(x: value.location.x / max(selection.width, 1),
+                                                              y: value.location.y / max(selection.height, 1))
+                                        if draft == nil { draft = Markup(tool: selectedTool, points: [start], color: selectedColor) }
+                                        if selectedTool == .pen { draft?.points.append(current) }
+                                        else { draft?.points = [start, current] }
+                                    }
+                                    .onEnded { value in
+                                        if selectedTool == .text {
+                                            movingMarkupID = nil
+                                            movingMarkupOrigin = nil
+                                        } else if let draft {
+                                            markups.append(draft)
+                                        }
+                                        draft = nil
+                                    })
+                                    .simultaneousGesture(SpatialTapGesture().onEnded { value in
+                                        guard selectedTool == .text else { return }
+                                        beginTextEntry(at: value.location, in: selection.size)
+                                    })
+                        }
+                        if let entryPosition = textEntryPosition {
+                            let fieldWidth = max(40, min(240, selection.width - 8))
+                            let x = min(max(entryPosition.x * selection.width, 4), max(4, selection.width - fieldWidth - 4))
+                            let y = min(max(entryPosition.y * selection.height, 4), max(4, selection.height - 36))
+                            TextField("输入文字", text: $annotationText)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: selectedFontSize, weight: .bold))
+                                .frame(width: fieldWidth)
+                                .foregroundStyle(selectedColor)
+                                .focused($textFieldFocused)
+                                .background(Color.clear)
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 5)
+                                        .stroke(selectedColor.opacity(0.9), lineWidth: 1)
+                                }
+                                .onSubmit(commitTextEntry)
+                                .position(x: x + fieldWidth / 2, y: y + 18)
+                        }
+                    }
                     .frame(width: selection.width, height: selection.height)
                     .position(x: selection.midX, y: selection.midY)
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 2)
-                        .onChanged { value in
-                            guard hasSelection else { return }
-                            if moveOrigin == nil { moveOrigin = selection }
-                            moveSelection(value.translation)
+                    .allowsHitTesting(selectedTool != nil || textEntryPosition != nil)
+                }
+
+                if let selection, dragOrigin == nil {
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            ForEach(MarkupTool.allCases) { item in
+                                Button {
+                                    if textEntryPosition != nil { commitTextEntry() }
+                                    selectedTool = selectedTool == item ? nil : item
+                                } label: {
+                                    toolbarIcon(item.symbol)
+                                        .foregroundStyle(.white)
+                                        .background {
+                                            if selectedTool == item {
+                                                RoundedRectangle(cornerRadius: 7)
+                                                    .fill(Color.accentColor.opacity(0.92))
+                                            }
+                                        }
+                                        .overlay {
+                                            if selectedTool == item {
+                                                RoundedRectangle(cornerRadius: 7)
+                                                    .strokeBorder(.white.opacity(0.9), lineWidth: 1)
+                                            }
+                                        }
+                                }
+                                .help(item.rawValue)
+                            }
+                            if selectedTool == .text {
+                                FontSizePicker(selection: $selectedFontSize)
+                            }
+                            Button { if !markups.isEmpty { markups.removeLast() } } label: { toolbarIcon("arrow.uturn.backward") }
+                                .help("撤销标注")
+                            Button(action: onCancel) { toolbarIcon("xmark") }
+                                .help("取消截图")
+                                .keyboardShortcut(.cancelAction)
+                            Rectangle().fill(.white.opacity(0.45)).frame(width: 1, height: 20)
+                            Button { finish(.pin, rect: selection) } label: { toolbarIcon("pin.fill") }
+                                .help("钉住图片")
+                            Button { finish(.copy, rect: selection) } label: { toolbarIcon("doc.on.doc") }
+                                .help("复制图片并关闭")
+                            Button { finish(.save, rect: selection) } label: { toolbarIcon("square.and.arrow.down") }
+                                .help("保存图片")
                         }
-                        .onEnded { _ in moveOrigin = nil })
-            }
-            if hasSelection {
-                ForEach(SelectionResizeHandle.allCases) { handle in
-                    Circle()
-                        .fill(.white)
-                        .frame(width: 12, height: 12)
-                        .overlay(Circle().stroke(.cyan, lineWidth: 2))
-                        .frame(width: 24, height: 24)
-                        .position(handlePoint(handle))
-                        .contentShape(Rectangle())
-                        .gesture(DragGesture(minimumDistance: 1)
-                            .onChanged { value in resizeSelection(handle, translation: value.translation) }
-                            .onEnded { _ in resizeOrigin = nil })
-                        .zIndex(2)
+                        CompactColorPalette(selection: $selectedColor)
+                    }
+                    .buttonStyle(.plain)
+                    .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+                    .position(
+                        x: min(max(selection.midX, 270), max(270, size.width - 270)),
+                        y: selection.maxY + 60 + 44 < size.height
+                            ? selection.maxY + 60
+                            : max(44, selection.minY - 60)
+                    )
                 }
-                HStack(spacing: 5) {
-                    Button { onFinish(selection, .edit) } label: { Image(systemName: "pencil.tip.crop.circle").help("编辑标注") }
-                    Button { onFinish(selection, .copy) } label: { Image(systemName: "doc.on.doc").help("复制图片") }
-                    Button { onFinish(selection, .save) } label: { Image(systemName: "square.and.arrow.down").help("保存图片") }
-                    Button { onFinish(selection, .pin) } label: { Image(systemName: "pin.fill").help("钉住图片") }
-                    Button(action: onCancel) { Image(systemName: "xmark").help("取消截图") }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .position(x: selection.midX,
-                          y: selection.maxY + 36 < screenSize.height ? selection.maxY + 36 : max(28, selection.minY - 36))
-                .zIndex(3)
             }
+            .frame(width: size.width, height: size.height)
+            .clipped()
         }
-        .frame(width: screenSize.width, height: screenSize.height)
-        .clipped()
         .onExitCommand(perform: onCancel)
+        .onChange(of: textFieldFocused) { _, isFocused in
+            if !isFocused, textEntryPosition != nil { commitTextEntry() }
+        }
+    }
+
+    private func toolbarIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 30, height: 30)
+            .contentShape(Rectangle())
     }
 }
 
@@ -630,6 +792,24 @@ private struct Markup: Identifiable {
     var points: [CGPoint]
     var label: String = ""
     var color: Color = .red
+    var fontSize: CGFloat = 0
+}
+
+private struct FontSizePicker: View {
+    @Binding var selection: CGFloat
+    private let sizes: [CGFloat] = [12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64]
+
+    var body: some View {
+        Picker("字号", selection: $selection) {
+            ForEach(sizes, id: \.self) { size in
+                Text("\(Int(size))").tag(size)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .frame(width: 54)
+        .help("文字字号")
+    }
 }
 
 private struct ScreenshotEditorView: View {
@@ -639,6 +819,7 @@ private struct ScreenshotEditorView: View {
     let panelID: UUID
     @State private var tool: MarkupTool = .pen
     @State private var selectedColor: Color = .red
+    @State private var selectedFontSize: CGFloat = 24
     @State private var markups: [Markup] = []
     @State private var draft: Markup?
     @State private var annotationText = ""
@@ -668,7 +849,7 @@ private struct ScreenshotEditorView: View {
     }
 
     private func drawMarkups(in context: inout GraphicsContext, size: CGSize, showsSelection: Bool = true) {
-        for markup in markups + (draft.map { [$0] } ?? []) {
+        for markup in markups.filter({ $0.id != editingMarkupID }) + (draft.map { [$0] } ?? []) {
             guard let first = markup.points.first else { continue }
             func point(_ value: CGPoint) -> CGPoint {
                 CGPoint(x: value.x * size.width, y: value.y * size.height)
@@ -691,7 +872,7 @@ private struct ScreenshotEditorView: View {
             }
             context.stroke(path, with: .color(markup.color), style: StrokeStyle(lineWidth: max(2, size.width / 250), lineCap: .round, lineJoin: .round))
             if markup.tool == .text, !markup.label.isEmpty {
-                let fontSize = max(16, size.width / 30)
+                let fontSize = markup.fontSize > 0 ? markup.fontSize : max(16, size.width / 30)
                 let textRect = CGRect(x: first.x * size.width, y: first.y * size.height,
                                       width: max(fontSize, CGFloat(markup.label.count) * fontSize * 0.7),
                                       height: fontSize * 1.5)
@@ -702,12 +883,17 @@ private struct ScreenshotEditorView: View {
                 context.draw(Text(markup.label).font(.system(size: fontSize, weight: .bold)).foregroundColor(markup.color), at: point(first), anchor: .topLeading)
             }
         }
+        if let textEntryPosition, !annotationText.isEmpty, !textFieldFocused {
+            let previewPoint = CGPoint(x: textEntryPosition.x * size.width, y: textEntryPosition.y * size.height)
+            context.draw(Text(annotationText).font(.system(size: selectedFontSize, weight: .bold)).foregroundColor(selectedColor),
+                         at: previewPoint, anchor: .topLeading)
+        }
     }
 
     private func textMarkup(at location: CGPoint) -> Markup? {
-        let fontSize = max(16, selectionSize.width / 30)
         return markups.last { markup in
             guard markup.tool == .text, let origin = markup.points.first else { return false }
+            let fontSize = markup.fontSize > 0 ? markup.fontSize : max(16, selectionSize.width / 30)
             let rect = CGRect(x: origin.x * selectionSize.width - 9,
                               y: origin.y * selectionSize.height - 7,
                               width: max(fontSize, CGFloat(markup.label.count) * fontSize * 0.7) + 18,
@@ -727,6 +913,8 @@ private struct ScreenshotEditorView: View {
         if let existing {
             editingMarkupID = existing.id
             editingMarkupColor = existing.color
+            selectedColor = existing.color
+            selectedFontSize = existing.fontSize > 0 ? existing.fontSize : max(16, selectionSize.width / 30)
             selectedTextMarkupID = existing.id
             textEntryPosition = existing.points.first
             annotationText = existing.label
@@ -754,9 +942,11 @@ private struct ScreenshotEditorView: View {
                 if let editingMarkupColor, selectedColor != editingMarkupColor {
                     markups[index].color = selectedColor
                 }
+                markups[index].fontSize = selectedFontSize
             }
         } else if let textEntryPosition, !annotationText.isEmpty {
-            let markup = Markup(tool: .text, points: [textEntryPosition], label: annotationText, color: selectedColor)
+            let markup = Markup(tool: .text, points: [textEntryPosition], label: annotationText,
+                                color: selectedColor, fontSize: selectedFontSize)
             markups.append(markup)
             selectedTextMarkupID = markup.id
         }
@@ -809,9 +999,6 @@ private struct ScreenshotEditorView: View {
                         }
                         .onEnded { value in
                             if tool == .text {
-                                if movingMarkupID == nil, hypot(value.translation.width, value.translation.height) < 4 {
-                                    beginTextEntry(at: value.location)
-                                }
                                 movingMarkupID = nil
                                 movingMarkupOrigin = nil
                             } else if let draft {
@@ -819,32 +1006,32 @@ private struct ScreenshotEditorView: View {
                             }
                             draft = nil
                         })
+                        .simultaneousGesture(SpatialTapGesture().onEnded { value in
+                            guard tool == .text else { return }
+                            beginTextEntry(at: value.location)
+                        })
                 if let textEntryPosition {
-                    let fieldWidth = min(220, max(120, selectionSize.width - 76))
-                    let editorWidth = fieldWidth + 60
-                    let x = min(max(textEntryPosition.x * selectionSize.width, 4), max(4, selectionSize.width - editorWidth - 4))
+                    let fieldWidth = max(40, min(240, selectionSize.width - 8))
+                    let x = min(max(textEntryPosition.x * selectionSize.width, 4), max(4, selectionSize.width - fieldWidth - 4))
                     let y = min(max(textEntryPosition.y * selectionSize.height, 4), max(4, selectionSize.height - 38))
-                    HStack(spacing: 4) {
-                        TextField("输入文字", text: $annotationText)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: fieldWidth)
-                            .foregroundStyle(selectedColor)
-                            .focused($textFieldFocused)
-                            .onAppear {
-                                DispatchQueue.main.async {
-                                    textFieldFocused = true
-                                }
+                    TextField("输入文字", text: $annotationText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: selectedFontSize, weight: .bold))
+                        .frame(width: fieldWidth)
+                        .foregroundStyle(selectedColor)
+                        .focused($textFieldFocused)
+                        .background(Color.clear)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 5)
+                                .stroke(selectedColor.opacity(0.9), lineWidth: 1)
+                        }
+                        .onAppear {
+                            DispatchQueue.main.async {
+                                textFieldFocused = true
                             }
-                            .onSubmit(commitTextEntry)
-                        Button(action: commitTextEntry) {
-                            Image(systemName: "checkmark").frame(width: 24, height: 26)
-                        }.help("完成文字")
-                        Button(action: dismissTextEntry) {
-                            Image(systemName: "xmark").frame(width: 24, height: 26)
-                        }.help("取消文字")
-                    }
-                    .fixedSize()
-                    .position(x: x + editorWidth / 2, y: y + 18)
+                        }
+                        .onSubmit(commitTextEntry)
+                        .position(x: x + fieldWidth / 2, y: y + 18)
                 }
             }
             .frame(width: selectionSize.width, height: selectionSize.height)
@@ -860,6 +1047,9 @@ private struct ScreenshotEditorView: View {
                         } label: {
                             Image(systemName: item.symbol).frame(width: 27, height: 25)
                         }.help(item.rawValue).tint(tool == item ? .accentColor : .secondary)
+                    }
+                    if tool == .text {
+                        FontSizePicker(selection: $selectedFontSize)
                     }
                     Divider().frame(height: 20)
                     Button { if !markups.isEmpty { markups.removeLast() } } label: { Image(systemName: "arrow.uturn.backward") }.help("撤销")
@@ -890,6 +1080,9 @@ private struct ScreenshotEditorView: View {
         }
         .background(Color.clear)
         .onExitCommand { model.closeEditor(panelID) }
+        .onChange(of: textFieldFocused) { _, isFocused in
+            if !isFocused, textEntryPosition != nil { commitTextEntry() }
+        }
     }
 }
 
@@ -955,8 +1148,8 @@ private struct PinnedScreenshotView: View {
             .overlay {
                 Rectangle()
                     .strokeBorder(Color.white.opacity(0.72), lineWidth: 1)
-                    .shadow(color: .black.opacity(0.55), radius: 7, x: 0, y: 2)
             }
+            .shadow(color: .blue.opacity(0.58), radius: 12, x: 0, y: 0)
             .background(Color.clear)
             .onTapGesture(count: 2, perform: onClose)
             .gesture(
