@@ -117,7 +117,6 @@ final class PiOcrModel {
             },
             onAction: { [weak self] rect, action, cropImage in
                 guard let self else { return }
-                self.closeSelectionCanvases()
                 self.screenshot = cropImage
 
                 let globalRect = CGRect(
@@ -128,11 +127,17 @@ final class PiOcrModel {
                 )
                 switch action {
                 case .pin:
+                    self.closeSelectionCanvases()
                     guard let editorID = self.showEditor(at: globalRect, on: screen) else { return }
                     self.pinEditor(editorID, image: cropImage)
                 case .copy:
-                    _ = self.copyImage(cropImage)
+                    guard self.copyImage(cropImage) else {
+                        self.showCopyFailure()
+                        return
+                    }
+                    self.closeSelectionCanvases()
                 case .save:
+                    self.closeSelectionCanvases()
                     guard let editorID = self.showEditor(at: globalRect, on: screen) else { return }
                     self.saveImage(cropImage, from: editorID)
                 }
@@ -296,15 +301,23 @@ final class PiOcrModel {
 
     @discardableResult
     func copyImage(_ image: NSImage) -> Bool {
-        NSPasteboard.general.clearContents()
-        return NSPasteboard.general.writeObjects([image])
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.writeObjects([image])
+    }
+
+    func showCopyFailure() {
+        showMessage("复制图片失败", detail: "无法将截图图片写入系统剪贴板。")
     }
 
     func saveImage(_ image: NSImage, from editorID: UUID) {
         guard let editorWindow = editorPanels[editorID] else { return }
         let savePanel = NSSavePanel()
         savePanel.allowedContentTypes = [.png]
-        savePanel.nameFieldStringValue = "PiOcr 截图.png"
+        let timestampFormatter = DateFormatter()
+        timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
+        timestampFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        savePanel.nameFieldStringValue = "\(timestampFormatter.string(from: Date())).png"
         savePanel.beginSheetModal(for: editorWindow) { [weak self] response in
             guard let self, response == .OK,
                   let url = savePanel.url,
@@ -345,6 +358,63 @@ private struct SelectionDragInput: NSViewRepresentable {
         view.onStart = onStart
         view.onMove = onMove
         view.onEnd = onEnd
+    }
+}
+
+private struct CaptureEnterKeyMonitor: NSViewRepresentable {
+    let isTextFieldFocused: Bool
+    let onEnter: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(isTextFieldFocused: isTextFieldFocused, onEnter: onEnter)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.hostView = view
+        context.coordinator.start()
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.hostView = view
+        context.coordinator.isTextFieldFocused = isTextFieldFocused
+        context.coordinator.onEnter = onEnter
+    }
+
+    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    @MainActor
+    final class Coordinator {
+        weak var hostView: NSView?
+        var isTextFieldFocused: Bool
+        var onEnter: () -> Void
+        private var eventMonitor: Any?
+
+        init(isTextFieldFocused: Bool, onEnter: @escaping () -> Void) {
+            self.isTextFieldFocused = isTextFieldFocused
+            self.onEnter = onEnter
+        }
+
+        func start() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self,
+                      let eventWindowNumber = event.window?.windowNumber,
+                      self.hostView?.window?.windowNumber == eventWindowNumber,
+                      event.keyCode == 36 || event.keyCode == 76,
+                      !self.isTextFieldFocused else { return event }
+                self.onEnter()
+                return nil
+            }
+        }
+
+        func stop() {
+            if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+            eventMonitor = nil
+        }
     }
 }
 
@@ -736,6 +806,11 @@ private struct SelectionCanvasView: View {
                         CompactColorPalette(selection: $selectedColor)
                     }
                     .buttonStyle(.plain)
+                    .padding(8)
+                    .background {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.black)
+                    }
                     .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
                     .position(
                         x: min(max(selection.midX, 270), max(270, size.width - 270)),
@@ -747,6 +822,13 @@ private struct SelectionCanvasView: View {
             }
             .frame(width: size.width, height: size.height)
             .clipped()
+        }
+        .background {
+            CaptureEnterKeyMonitor(isTextFieldFocused: textFieldFocused) {
+                guard let selection, dragOrigin == nil else { return }
+                finish(.copy, rect: selection)
+            }
+            .frame(width: 0, height: 0)
         }
         .onExitCommand(perform: onCancel)
         .onChange(of: textFieldFocused) { _, isFocused in
@@ -1054,8 +1136,13 @@ private struct ScreenshotEditorView: View {
                     Divider().frame(height: 20)
                     Button { if !markups.isEmpty { markups.removeLast() } } label: { Image(systemName: "arrow.uturn.backward") }.help("撤销")
                     Button {
-                        if model.copyImage(compositedImage) { model.closeEditor(panelID) }
-                    } label: { Image(systemName: "doc.on.doc") }.help("复制截图并关闭")
+                        if model.copyImage(compositedImage) {
+                            model.closeEditor(panelID)
+                        } else {
+                            model.showCopyFailure()
+                        }
+                    } label: { Image(systemName: "doc.on.doc") }
+                        .help("复制截图并关闭")
                     Button {
                         model.saveImage(compositedImage, from: panelID)
                     } label: { Image(systemName: "square.and.arrow.down") }.help("保存图片并关闭")
@@ -1077,6 +1164,12 @@ private struct ScreenshotEditorView: View {
             .background(Color.clear)
             .padding(.horizontal, 8)
             .padding(.bottom, 6)
+        }
+        .background {
+            CaptureEnterKeyMonitor(isTextFieldFocused: textFieldFocused) {
+                if model.copyImage(compositedImage) { model.closeEditor(panelID) }
+            }
+            .frame(width: 0, height: 0)
         }
         .background(Color.clear)
         .onExitCommand { model.closeEditor(panelID) }
