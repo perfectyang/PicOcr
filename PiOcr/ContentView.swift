@@ -5,6 +5,7 @@
 
 import AppKit
 import CoreGraphics
+import CoreText
 import Observation
 import ScreenCaptureKit
 import SwiftUI
@@ -301,13 +302,57 @@ final class PiOcrModel {
 
     @discardableResult
     func copyImage(_ image: NSImage) -> Bool {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
+        guard let pngData = bitmap.representation(using: .png, properties: [:]) else { return false }
+
+        pruneStaleClipboardImages()
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiOcr-clipboard-\(UUID().uuidString).png")
+        do {
+            try pngData.write(to: fileURL, options: .atomic)
+        } catch {
+            return false
+        }
+
+        let item = NSPasteboardItem()
+        guard item.setData(pngData, forType: .png),
+              item.setString(fileURL.absoluteString, forType: .fileURL) else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return false
+        }
+        if let tiffData = bitmap.representation(using: .tiff, properties: [:]) {
+            item.setData(tiffData, forType: .tiff)
+        }
+
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        return pasteboard.writeObjects([image])
+        guard pasteboard.writeObjects([item]) else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return false
+        }
+        return true
+    }
+
+    private func pruneStaleClipboardImages() {
+        let fileManager = FileManager.default
+        let temporaryDirectory = fileManager.temporaryDirectory
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let expirationDate = Date().addingTimeInterval(-24 * 60 * 60)
+        for file in files where file.lastPathComponent.hasPrefix("PiOcr-clipboard-") && file.pathExtension == "png" {
+            guard let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  modified < expirationDate else { continue }
+            try? fileManager.removeItem(at: file)
+        }
     }
 
     func showCopyFailure() {
-        showMessage("复制图片失败", detail: "无法将截图图片写入系统剪贴板。")
+        showMessage("复制图片失败", detail: "无法将截图编码或写入系统剪贴板。")
     }
 
     func saveImage(_ image: NSImage, from editorID: UUID) {
@@ -471,6 +516,19 @@ private enum SelectionAction {
 }
 
 private struct SelectionCanvasView: View {
+    private enum ResizeCorner: CaseIterable, Hashable {
+        case topLeft, topRight, bottomLeft, bottomRight
+        case top, right, bottom, left
+
+        var isHorizontalEdge: Bool {
+            self == .top || self == .bottom
+        }
+
+        var isVerticalEdge: Bool {
+            self == .left || self == .right
+        }
+    }
+
     let image: NSImage
     let recognize: Bool
     let onSelection: (CGRect) -> Void
@@ -480,6 +538,7 @@ private struct SelectionCanvasView: View {
     @State private var selection: CGRect?
     @State private var dragOrigin: CGPoint?
     @State private var selectionAtDragStart: CGRect?
+    @State private var selectionAtResizeStart: CGRect?
     @State private var selectedTool: MarkupTool?
     @State private var selectedColor: Color = .red
     @State private var selectedFontSize: CGFloat = 24
@@ -510,6 +569,77 @@ private struct SelectionCanvasView: View {
             width: abs(boundedPoint.x - dragOrigin.x),
             height: abs(boundedPoint.y - dragOrigin.y)
         )
+    }
+
+    private func updateResize(corner: ResizeCorner, translation: CGSize, from original: CGRect, in size: CGSize) {
+        let minimumWidth = min(20, size.width)
+        let minimumHeight = min(20, size.height)
+        var minX = original.minX
+        var minY = original.minY
+        var maxX = original.maxX
+        var maxY = original.maxY
+
+        switch corner {
+        case .topLeft:
+            minX = min(max(original.minX + translation.width, 0), original.maxX - minimumWidth)
+            minY = min(max(original.minY + translation.height, 0), original.maxY - minimumHeight)
+        case .topRight:
+            maxX = min(max(original.maxX + translation.width, original.minX + minimumWidth), size.width)
+            minY = min(max(original.minY + translation.height, 0), original.maxY - minimumHeight)
+        case .bottomLeft:
+            minX = min(max(original.minX + translation.width, 0), original.maxX - minimumWidth)
+            maxY = min(max(original.maxY + translation.height, original.minY + minimumHeight), size.height)
+        case .bottomRight:
+            maxX = min(max(original.maxX + translation.width, original.minX + minimumWidth), size.width)
+            maxY = min(max(original.maxY + translation.height, original.minY + minimumHeight), size.height)
+        case .top:
+            minY = min(max(original.minY + translation.height, 0), original.maxY - minimumHeight)
+        case .right:
+            maxX = min(max(original.maxX + translation.width, original.minX + minimumWidth), size.width)
+        case .bottom:
+            maxY = min(max(original.maxY + translation.height, original.minY + minimumHeight), size.height)
+        case .left:
+            minX = min(max(original.minX + translation.width, 0), original.maxX - minimumWidth)
+        }
+
+        selection = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    private func selectionCorner(_ corner: ResizeCorner, in rect: CGRect) -> CGPoint {
+        switch corner {
+        case .topLeft: CGPoint(x: rect.minX, y: rect.minY)
+        case .topRight: CGPoint(x: rect.maxX, y: rect.minY)
+        case .bottomLeft: CGPoint(x: rect.minX, y: rect.maxY)
+        case .bottomRight: CGPoint(x: rect.maxX, y: rect.maxY)
+        case .top: CGPoint(x: rect.midX, y: rect.minY)
+        case .right: CGPoint(x: rect.maxX, y: rect.midY)
+        case .bottom: CGPoint(x: rect.midX, y: rect.maxY)
+        case .left: CGPoint(x: rect.minX, y: rect.midY)
+        }
+    }
+
+    private func resizeHandle(_ corner: ResizeCorner, selection: CGRect, canvasSize: CGSize) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.white)
+                .frame(width: corner.isHorizontalEdge ? 16 : (corner.isVerticalEdge ? 8 : 11),
+                       height: corner.isVerticalEdge ? 16 : (corner.isHorizontalEdge ? 8 : 11))
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.cyan, lineWidth: 2))
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color.clear)
+                .frame(width: corner.isHorizontalEdge ? 32 : 26,
+                       height: corner.isVerticalEdge ? 32 : 26)
+        }
+        .contentShape(Circle())
+        .position(selectionCorner(corner, in: selection))
+        .gesture(DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if selectionAtResizeStart == nil { selectionAtResizeStart = selection }
+                guard let origin = selectionAtResizeStart else { return }
+                updateResize(corner: corner, translation: value.translation, from: origin, in: canvasSize)
+            }
+            .onEnded { _ in selectionAtResizeStart = nil })
+        .zIndex(2)
     }
 
     private func textMarkup(at location: CGPoint, in size: CGSize) -> Markup? {
@@ -615,18 +745,15 @@ private struct SelectionCanvasView: View {
             .integral.intersection(CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
         guard let cropped = cgImage.cropping(to: pixelRect) else { return nil }
         let base = NSImage(cgImage: cropped, size: rect.size)
-        guard !markups.isEmpty else { return base }
-
-        let renderer = ImageRenderer(content:
-            ZStack {
-                Image(nsImage: base).resizable().frame(width: rect.width, height: rect.height)
-                Canvas { context, size in drawMarkups(in: &context, size: size) }
-                    .frame(width: rect.width, height: rect.height)
-            }
-            .frame(width: rect.width, height: rect.height)
-        )
-        renderer.scale = max(1, CGFloat(cropped.width) / max(rect.width, 1))
-        return renderer.nsImage ?? base
+        let sourceMarkups = markups.filter { $0.id != editingMarkupID } + (draft.map { [$0] } ?? [])
+        guard !sourceMarkups.isEmpty else { return base }
+        let snapshots = sourceMarkups.map {
+            rasterSnapshot(for: $0, fallbackFontSize: max(16, rect.width / 30))
+        }
+        guard let renderedImage = ScreenshotRasterizer.render(base: cropped, pointSize: rect.size, markups: snapshots) else {
+            return base
+        }
+        return NSImage(cgImage: renderedImage, size: rect.size)
     }
 
     private func finish(_ action: SelectionAction, rect: CGRect) {
@@ -762,6 +889,12 @@ private struct SelectionCanvasView: View {
                     .allowsHitTesting(selectedTool != nil || textEntryPosition != nil)
                 }
 
+                if selectedTool == nil, dragOrigin == nil, let selection {
+                    ForEach(ResizeCorner.allCases, id: \.self) { corner in
+                        resizeHandle(corner, selection: selection, canvasSize: size)
+                    }
+                }
+
                 if let selection, dragOrigin == nil {
                     VStack(spacing: 4) {
                         HStack(spacing: 6) {
@@ -877,6 +1010,132 @@ private struct Markup: Identifiable {
     var fontSize: CGFloat = 0
 }
 
+private enum RasterMarkupKind: Int, Sendable {
+    case pen, arrow, rectangle, text
+}
+
+private struct RasterMarkup: Sendable {
+    let kind: RasterMarkupKind
+    let points: [CGPoint]
+    let label: String
+    let fontSize: CGFloat
+    let red: CGFloat
+    let green: CGFloat
+    let blue: CGFloat
+    let alpha: CGFloat
+}
+
+private func rasterSnapshot(for markup: Markup, fallbackFontSize: CGFloat) -> RasterMarkup {
+    let kind: RasterMarkupKind
+    switch markup.tool {
+    case .pen: kind = .pen
+    case .arrow: kind = .arrow
+    case .rectangle: kind = .rectangle
+    case .text: kind = .text
+    }
+    let color = NSColor(markup.color).usingColorSpace(.deviceRGB) ?? .red
+    var red: CGFloat = 1
+    var green: CGFloat = 0
+    var blue: CGFloat = 0
+    var alpha: CGFloat = 1
+    color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+    return RasterMarkup(kind: kind,
+                        points: markup.points,
+                        label: markup.label,
+                        fontSize: markup.fontSize > 0 ? markup.fontSize : fallbackFontSize,
+                        red: red, green: green, blue: blue, alpha: alpha)
+}
+
+private enum ScreenshotRasterizer {
+    nonisolated static func render(base: CGImage, pointSize: CGSize, markups: [RasterMarkup]) -> CGImage? {
+        let pixelWidth = base.width
+        let pixelHeight = base.height
+        guard pixelWidth > 0, pixelHeight > 0,
+              let context = CGContext(data: nil,
+                                      width: pixelWidth,
+                                      height: pixelHeight,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: pixelWidth * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGBitmapInfo.byteOrder32Big.union(
+                                        CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+                                      ).rawValue) else { return nil }
+
+        context.setShouldAntialias(true)
+        context.setAllowsAntialiasing(true)
+        context.saveGState()
+        context.translateBy(x: 0, y: CGFloat(pixelHeight))
+        context.scaleBy(x: 1, y: -1)
+        context.draw(base, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        context.restoreGState()
+
+        let width = max(pointSize.width, 1)
+        let height = max(pointSize.height, 1)
+        let scaleX = CGFloat(pixelWidth) / width
+        let scaleY = CGFloat(pixelHeight) / height
+        let pixelHeightValue = CGFloat(pixelHeight)
+
+        for markup in markups {
+            let color = CGColor(colorSpace: CGColorSpaceCreateDeviceRGB(), components: [markup.red, markup.green, markup.blue, markup.alpha])
+                ?? CGColor(gray: 0, alpha: 1)
+            context.setStrokeColor(color)
+            context.setFillColor(color)
+            context.setLineWidth(max(2, width / 250) * scaleX)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+
+            func point(_ value: CGPoint) -> CGPoint {
+                CGPoint(x: value.x * width * scaleX,
+                        y: pixelHeightValue - value.y * height * scaleY)
+            }
+
+            if markup.kind == .text {
+                guard let origin = markup.points.first, !markup.label.isEmpty else { continue }
+                guard let font = CTFontCreateUIFontForLanguage(.system, markup.fontSize * scaleY, nil) else { continue }
+                let boldFont = CTFontCreateCopyWithSymbolicTraits(font, 0, nil, .traitBold, .traitBold) ?? font
+                let attributes: [NSAttributedString.Key: Any] = [
+                    NSAttributedString.Key(kCTFontAttributeName as String): boldFont,
+                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): color
+                ]
+                let line = CTLineCreateWithAttributedString(NSAttributedString(string: markup.label, attributes: attributes))
+                let baseline = pixelHeightValue - origin.y * height * scaleY - CTFontGetAscent(boldFont)
+                context.textPosition = CGPoint(x: origin.x * width * scaleX, y: baseline)
+                CTLineDraw(line, context)
+                continue
+            }
+
+            guard let first = markup.points.first else { continue }
+            let path = CGMutablePath()
+            path.move(to: point(first))
+            if markup.kind == .pen {
+                for value in markup.points.dropFirst() { path.addLine(to: point(value)) }
+            } else if markup.points.count > 1 {
+                let end = point(markup.points[1])
+                if markup.kind == .rectangle {
+                    let start = point(first)
+                    let rect = CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                                      width: abs(start.x - end.x), height: abs(start.y - end.y))
+                    path.addRect(rect)
+                } else if markup.kind == .arrow {
+                    path.addLine(to: end)
+                    let start = point(first)
+                    let angle = atan2(end.y - start.y, end.x - start.x)
+                    let headLength: CGFloat = 12 * scaleX
+                    for offset: CGFloat in [-0.55, 0.55] {
+                        path.move(to: end)
+                        path.addLine(to: CGPoint(x: end.x - headLength * cos(angle + offset),
+                                                 y: end.y - headLength * sin(angle + offset)))
+                    }
+                }
+            }
+            context.addPath(path)
+            context.strokePath()
+        }
+
+        return context.makeImage()
+    }
+}
+
 private struct FontSizePicker: View {
     @Binding var selection: CGFloat
     private let sizes: [CGFloat] = [12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64]
@@ -895,6 +1154,14 @@ private struct FontSizePicker: View {
 }
 
 private struct ScreenshotEditorView: View {
+    private enum ExportAction {
+        case copy, save, pin
+    }
+
+    private enum TextResizeHandle: CaseIterable, Hashable {
+        case topLeft, topRight, bottomLeft, bottomRight
+    }
+
     @Bindable var model: PiOcrModel
     let image: NSImage
     let selectionSize: CGSize
@@ -911,23 +1178,60 @@ private struct ScreenshotEditorView: View {
     @State private var movingMarkupID: UUID?
     @State private var movingMarkupOrigin: CGPoint?
     @State private var selectedTextMarkupID: UUID?
+    @State private var resizingMarkupID: UUID?
+    @State private var resizeStartFontSize: CGFloat = 24
+    @State private var resizeStartOrigin: CGPoint = .zero
+    @State private var resizeStartBounds: CGRect = .zero
+    @State private var resizeAnchorPoint: CGPoint = .zero
+    @State private var isHoveringTextResizeHandle = false
+    @State private var resizingTextEntry = false
+    @State private var textEntryResizeStartFontSize: CGFloat = 24
+    @State private var textEntryResizeStartPosition: CGPoint = .zero
+    @State private var textEntryResizeStartBounds: CGRect = .zero
+    @State private var textEntryResizeAnchorPoint: CGPoint = .zero
+    @State private var isCompositing = false
     @FocusState private var textFieldFocused: Bool
 
-    private var compositedImage: NSImage {
-        // Keep the native screenshot representation when there is nothing to
-        // composite. ImageRenderer at 1x would otherwise discard Retina pixels.
-        guard !markups.isEmpty || draft != nil else { return image }
-        let size = NSSize(width: max(image.size.width, 1), height: max(image.size.height, 1))
-        let renderer = ImageRenderer(content:
-            ZStack {
-                Image(nsImage: image).resizable().frame(width: size.width, height: size.height)
-                Canvas { context, canvasSize in drawMarkups(in: &context, size: canvasSize, showsSelection: false) }
+    private func performExport(_ action: ExportAction) {
+        if textEntryPosition != nil { commitTextEntry() }
+        let sourceMarkups = markups.filter { $0.id != editingMarkupID } + (draft.map { [$0] } ?? [])
+        guard !sourceMarkups.isEmpty else {
+            completeExport(action, image: image)
+            return
+        }
+        guard let base = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            model.showCopyFailure()
+            return
+        }
+
+        let snapshots = sourceMarkups.map {
+            rasterSnapshot(for: $0, fallbackFontSize: max(16, image.size.width / 30))
+        }
+        let pointSize = image.size
+        isCompositing = true
+        Task {
+            let output = await Task.detached(priority: .userInitiated) {
+                ScreenshotRasterizer.render(base: base, pointSize: pointSize, markups: snapshots)
+            }.value
+            isCompositing = false
+            guard let output else {
+                model.showCopyFailure()
+                return
             }
-            .frame(width: size.width, height: size.height)
-        )
-        let pixelWidth = image.cgImage(forProposedRect: nil, context: nil, hints: nil)?.width
-        renderer.scale = max(1, CGFloat(pixelWidth ?? Int(size.width)) / size.width)
-        return renderer.nsImage ?? image
+            completeExport(action, image: NSImage(cgImage: output, size: pointSize))
+        }
+    }
+
+    private func completeExport(_ action: ExportAction, image: NSImage) {
+        switch action {
+        case .copy:
+            if model.copyImage(image) { model.closeEditor(panelID) }
+            else { model.showCopyFailure() }
+        case .save:
+            model.saveImage(image, from: panelID)
+        case .pin:
+            model.pinEditor(panelID, image: image)
+        }
     }
 
     private func drawMarkups(in context: inout GraphicsContext, size: CGSize, showsSelection: Bool = true) {
@@ -984,6 +1288,177 @@ private struct ScreenshotEditorView: View {
         }
     }
 
+    private func textBounds(for markup: Markup) -> CGRect? {
+        guard let origin = markup.points.first else { return nil }
+        let fontSize = markup.fontSize > 0 ? markup.fontSize : max(16, selectionSize.width / 30)
+        let textRect = CGRect(x: origin.x * selectionSize.width, y: origin.y * selectionSize.height,
+                              width: max(fontSize, CGFloat(markup.label.count) * fontSize * 0.7),
+                              height: fontSize * 1.5)
+        return textRect.insetBy(dx: -8, dy: -6)
+    }
+
+    private func handlePoint(_ handle: TextResizeHandle, in rect: CGRect) -> CGPoint {
+        switch handle {
+        case .topLeft: CGPoint(x: rect.minX, y: rect.minY)
+        case .topRight: CGPoint(x: rect.maxX, y: rect.minY)
+        case .bottomLeft: CGPoint(x: rect.minX, y: rect.maxY)
+        case .bottomRight: CGPoint(x: rect.maxX, y: rect.maxY)
+        }
+    }
+
+    private func oppositeHandle(_ handle: TextResizeHandle) -> TextResizeHandle {
+        switch handle {
+        case .topLeft: .bottomRight
+        case .topRight: .bottomLeft
+        case .bottomLeft: .topRight
+        case .bottomRight: .topLeft
+        }
+    }
+
+    private func textEntryBounds() -> CGRect? {
+        guard let textEntryPosition, !annotationText.isEmpty else { return nil }
+        let origin = CGPoint(x: textEntryPosition.x * selectionSize.width,
+                             y: textEntryPosition.y * selectionSize.height)
+        let textRect = CGRect(x: origin.x, y: origin.y,
+                              width: max(selectedFontSize, CGFloat(annotationText.count) * selectedFontSize * 0.7),
+                              height: selectedFontSize * 1.5)
+        return textRect.insetBy(dx: -8, dy: -6)
+    }
+
+    private func resizeTextEntry(_ handle: TextResizeHandle, translation: CGSize) {
+        guard let bounds = textEntryBounds(), let textEntryPosition else { return }
+        if !resizingTextEntry {
+            resizingTextEntry = true
+            textEntryResizeStartFontSize = selectedFontSize
+            textEntryResizeStartPosition = textEntryPosition
+            textEntryResizeStartBounds = bounds
+            textEntryResizeAnchorPoint = handlePoint(oppositeHandle(handle), in: bounds)
+        }
+
+        let start = handlePoint(handle, in: textEntryResizeStartBounds)
+        let current = CGPoint(x: start.x + translation.width, y: start.y + translation.height)
+        let startDistance = hypot(start.x - textEntryResizeAnchorPoint.x, start.y - textEntryResizeAnchorPoint.y)
+        let currentDistance = hypot(current.x - textEntryResizeAnchorPoint.x, current.y - textEntryResizeAnchorPoint.y)
+        let fontSize = min(max(textEntryResizeStartFontSize * currentDistance / max(startDistance, 1), 8), 180)
+        let textWidth = max(fontSize, CGFloat(annotationText.count) * fontSize * 0.7)
+        let textHeight = fontSize * 1.5
+        var originX = textEntryResizeStartPosition.x * selectionSize.width
+        var originY = textEntryResizeStartPosition.y * selectionSize.height
+        switch handle {
+        case .topLeft:
+            originX = textEntryResizeAnchorPoint.x - textWidth - 16
+            originY = textEntryResizeAnchorPoint.y - textHeight - 12
+        case .topRight:
+            originX = textEntryResizeAnchorPoint.x + 8
+            originY = textEntryResizeAnchorPoint.y - textHeight - 12
+        case .bottomLeft:
+            originX = textEntryResizeAnchorPoint.x - textWidth - 16
+            originY = textEntryResizeAnchorPoint.y + 6
+        case .bottomRight:
+            originX = textEntryResizeAnchorPoint.x + 8
+            originY = textEntryResizeAnchorPoint.y + 6
+        }
+        originX = min(max(originX, 0), max(0, selectionSize.width - textWidth))
+        originY = min(max(originY, 0), max(0, selectionSize.height - textHeight))
+        selectedFontSize = fontSize
+        self.textEntryPosition = CGPoint(x: originX / max(selectionSize.width, 1),
+                                         y: originY / max(selectionSize.height, 1))
+    }
+
+    private func resizeTextMarkup(_ handle: TextResizeHandle, markupID: UUID, translation: CGSize) {
+        guard let index = markups.firstIndex(where: { $0.id == markupID }),
+              let bounds = textBounds(for: markups[index]) else { return }
+        if resizingMarkupID != markupID {
+            resizingMarkupID = markupID
+            resizeStartFontSize = markups[index].fontSize > 0 ? markups[index].fontSize : max(16, selectionSize.width / 30)
+            resizeStartOrigin = markups[index].points[0]
+            resizeStartBounds = bounds
+            resizeAnchorPoint = handlePoint(oppositeHandle(handle), in: bounds)
+        }
+
+        let start = handlePoint(handle, in: resizeStartBounds)
+        let current = CGPoint(x: start.x + translation.width, y: start.y + translation.height)
+        let startDistance = hypot(start.x - resizeAnchorPoint.x, start.y - resizeAnchorPoint.y)
+        let currentDistance = hypot(current.x - resizeAnchorPoint.x, current.y - resizeAnchorPoint.y)
+        let scale = currentDistance / max(startDistance, 1)
+        let fontSize = min(max(resizeStartFontSize * scale, 8), 180)
+        let textWidth = max(fontSize, CGFloat(markups[index].label.count) * fontSize * 0.7)
+        let textHeight = fontSize * 1.5
+
+        var originX = resizeStartOrigin.x * selectionSize.width
+        var originY = resizeStartOrigin.y * selectionSize.height
+        switch handle {
+        case .topLeft:
+            originX = resizeAnchorPoint.x - textWidth - 16
+            originY = resizeAnchorPoint.y - textHeight - 12
+        case .topRight:
+            originX = resizeAnchorPoint.x + 8
+            originY = resizeAnchorPoint.y - textHeight - 12
+        case .bottomLeft:
+            originX = resizeAnchorPoint.x - textWidth - 16
+            originY = resizeAnchorPoint.y + 6
+        case .bottomRight:
+            originX = resizeAnchorPoint.x + 8
+            originY = resizeAnchorPoint.y + 6
+        }
+        originX = min(max(originX, 0), max(0, selectionSize.width - textWidth))
+        originY = min(max(originY, 0), max(0, selectionSize.height - textHeight))
+        markups[index].fontSize = fontSize
+        markups[index].points[0] = CGPoint(x: originX / max(selectionSize.width, 1),
+                                           y: originY / max(selectionSize.height, 1))
+    }
+
+    private func textResizeHandle(_ handle: TextResizeHandle, markup: Markup, bounds: CGRect) -> some View {
+        ZStack {
+            Circle().fill(Color.blue).overlay(Circle().stroke(Color.white, lineWidth: 2))
+                .frame(width: 26, height: 26)
+            Image(systemName: handle == .topLeft || handle == .bottomRight
+                  ? "arrow.up.left.and.arrow.down.right" : "arrow.up.right.and.arrow.down.left")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white)
+            Circle().fill(Color.clear).frame(width: 38, height: 38)
+        }
+        .contentShape(Circle())
+        .position(handlePoint(handle, in: bounds))
+        .gesture(DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                resizeTextMarkup(handle, markupID: markup.id, translation: value.translation)
+            }
+            .onEnded { _ in
+                resizingMarkupID = nil
+            })
+        .onHover { hovering in
+            isHoveringTextResizeHandle = hovering
+        }
+        .zIndex(3)
+    }
+
+    private func textEntryResizeHandle(_ handle: TextResizeHandle, bounds: CGRect) -> some View {
+        ZStack {
+            Circle().fill(Color.blue).overlay(Circle().stroke(Color.white, lineWidth: 2))
+                .frame(width: 26, height: 26)
+            Image(systemName: handle == .topLeft || handle == .bottomRight
+                  ? "arrow.up.left.and.arrow.down.right" : "arrow.up.right.and.arrow.down.left")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white)
+            Circle().fill(Color.clear).frame(width: 38, height: 38)
+        }
+        .contentShape(Circle())
+        .position(handlePoint(handle, in: bounds))
+        .gesture(DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                resizeTextEntry(handle, translation: value.translation)
+            }
+            .onEnded { _ in
+                resizingTextEntry = false
+                commitTextEntry()
+            })
+        .onHover { hovering in
+            isHoveringTextResizeHandle = hovering
+        }
+        .zIndex(3)
+    }
+
     private func beginTextEntry(at location: CGPoint) {
         if textEntryPosition != nil { commitTextEntry() }
         let point = CGPoint(
@@ -1021,6 +1496,9 @@ private struct ScreenshotEditorView: View {
                 markups.remove(at: index)
             } else {
                 markups[index].label = annotationText
+                if let textEntryPosition {
+                    markups[index].points[0] = textEntryPosition
+                }
                 if let editingMarkupColor, selectedColor != editingMarkupColor {
                     markups[index].color = selectedColor
                 }
@@ -1093,7 +1571,8 @@ private struct ScreenshotEditorView: View {
                             beginTextEntry(at: value.location)
                         })
                 if let textEntryPosition {
-                    let fieldWidth = max(40, min(240, selectionSize.width - 8))
+                    let estimatedTextWidth = max(selectedFontSize, CGFloat(annotationText.count) * selectedFontSize * 0.7)
+                    let fieldWidth = max(40, min(240, min(selectionSize.width - 8, estimatedTextWidth + 16)))
                     let x = min(max(textEntryPosition.x * selectionSize.width, 4), max(4, selectionSize.width - fieldWidth - 4))
                     let y = min(max(textEntryPosition.y * selectionSize.height, 4), max(4, selectionSize.height - 38))
                     TextField("输入文字", text: $annotationText)
@@ -1115,9 +1594,35 @@ private struct ScreenshotEditorView: View {
                         .onSubmit(commitTextEntry)
                         .position(x: x + fieldWidth / 2, y: y + 18)
                 }
+                if tool == .text, let bounds = textEntryBounds() {
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(Color.blue, lineWidth: 1.5)
+                        .frame(width: bounds.width, height: bounds.height)
+                        .position(x: bounds.midX, y: bounds.midY)
+                        .allowsHitTesting(false)
+                    ForEach(TextResizeHandle.allCases, id: \.self) { handle in
+                        textEntryResizeHandle(handle, bounds: bounds)
+                    }
+                }
+                if tool == .text, textEntryPosition == nil,
+                   let selectedTextMarkupID,
+                   let markup = markups.first(where: { $0.id == selectedTextMarkupID }),
+                   let bounds = textBounds(for: markup) {
+                    ForEach(TextResizeHandle.allCases, id: \.self) { handle in
+                        textResizeHandle(handle, markup: markup, bounds: bounds)
+                    }
+                }
             }
             .frame(width: selectionSize.width, height: selectionSize.height)
             .clipped()
+            .overlay {
+                if isCompositing {
+                    ZStack {
+                        Color.black.opacity(0.16)
+                        ProgressView().controlSize(.small)
+                    }
+                }
+            }
             Divider()
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 3) {
@@ -1135,19 +1640,12 @@ private struct ScreenshotEditorView: View {
                     }
                     Divider().frame(height: 20)
                     Button { if !markups.isEmpty { markups.removeLast() } } label: { Image(systemName: "arrow.uturn.backward") }.help("撤销")
-                    Button {
-                        if model.copyImage(compositedImage) {
-                            model.closeEditor(panelID)
-                        } else {
-                            model.showCopyFailure()
-                        }
-                    } label: { Image(systemName: "doc.on.doc") }
+                    Button { performExport(.copy) } label: { Image(systemName: "doc.on.doc") }
                         .help("复制截图并关闭")
-                    Button {
-                        model.saveImage(compositedImage, from: panelID)
-                    } label: { Image(systemName: "square.and.arrow.down") }.help("保存图片并关闭")
+                    Button { performExport(.save) } label: { Image(systemName: "square.and.arrow.down") }
+                        .help("保存图片并关闭")
                     Button { model.closeEditor(panelID) } label: { Image(systemName: "xmark") }.help("关闭截图")
-                    Button { model.pinEditor(panelID, image: compositedImage) } label: {
+                    Button { performExport(.pin) } label: {
                         Image(systemName: "pin.fill")
                     }.help("钉住图片并退出编辑")
                     Spacer(minLength: 2)
@@ -1155,6 +1653,7 @@ private struct ScreenshotEditorView: View {
                         if model.isRecognizing { ProgressView().controlSize(.small) } else { Image(systemName: "text.viewfinder").frame(width: 27, height: 25) }
                     }.disabled(model.isRecognizing)
                 }
+                .disabled(isCompositing)
                 CompactColorPalette(selection: $selectedColor)
             }
             .buttonStyle(.bordered)
@@ -1167,14 +1666,17 @@ private struct ScreenshotEditorView: View {
         }
         .background {
             CaptureEnterKeyMonitor(isTextFieldFocused: textFieldFocused) {
-                if model.copyImage(compositedImage) { model.closeEditor(panelID) }
+                performExport(.copy)
             }
             .frame(width: 0, height: 0)
         }
         .background(Color.clear)
         .onExitCommand { model.closeEditor(panelID) }
         .onChange(of: textFieldFocused) { _, isFocused in
-            if !isFocused, textEntryPosition != nil { commitTextEntry() }
+            if !isFocused, textEntryPosition != nil,
+               !isHoveringTextResizeHandle, !resizingTextEntry {
+                commitTextEntry()
+            }
         }
     }
 }
