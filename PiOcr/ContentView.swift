@@ -366,8 +366,9 @@ final class PiOcrModel {
         savePanel.beginSheetModal(for: editorWindow) { [weak self] response in
             guard let self, response == .OK,
                   let url = savePanel.url,
-                  let data = image.tiffRepresentation,
-                  let bitmap = NSBitmapImageRep(data: data),
+                  let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+            let bitmap = NSBitmapImageRep(cgImage: cgImage)
+            guard
                   let png = bitmap.representation(using: .png, properties: [:]) else { return }
             do {
                 try png.write(to: url)
@@ -1063,11 +1064,7 @@ private enum ScreenshotRasterizer {
 
         context.setShouldAntialias(true)
         context.setAllowsAntialiasing(true)
-        context.saveGState()
-        context.translateBy(x: 0, y: CGFloat(pixelHeight))
-        context.scaleBy(x: 1, y: -1)
         context.draw(base, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-        context.restoreGState()
 
         let width = max(pointSize.width, 1)
         let height = max(pointSize.height, 1)
